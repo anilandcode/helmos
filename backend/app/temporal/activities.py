@@ -8,6 +8,7 @@ from app.database import AsyncSessionLocal
 from app.models.task import Task, Checkpoint
 from app.services.guardrail_service import GuardrailService
 from app.services.audit_service import AuditService
+from app.services import sandbox_client
 
 
 @activity.defn
@@ -35,9 +36,25 @@ async def execute_checkpoint(input: AgentTaskInput, checkpoint_index: int) -> Ch
         output = None
         confidence = None
 
+    # HelmOS Memory Sandbox integration: pull personalization context for
+    # this agent (see sandbox_client.py — agent_id stands in for a real
+    # "requesting user" id, which AgentTaskInput doesn't have yet) and
+    # fold it into the checkpoint's reasoning. Best-effort: never blocks
+    # or fails the checkpoint if the Sandbox is unreachable/unconfigured.
+    sandbox_memories = await sandbox_client.get_context(input.agent_id)
+    if sandbox_memories and reasoning:
+        reasoning = f"{reasoning} (personalization context: {'; '.join(sandbox_memories)})"
+
     async with AsyncSessionLocal() as session:
         guard_svc = GuardrailService(session)
         audit_svc = AuditService(session)
+
+        if sandbox_memories:
+            await audit_svc.log_event(
+                event_type="sandbox_context_used", action="memory_lookup", agent_id=input.agent_id,
+                task_id=input.task_id, severity="info", outcome="success",
+                details={"memory_count": len(sandbox_memories)},
+            )
 
         cost_check = await guard_svc.check_cost_threshold(input.agent_id, cost)
         if not cost_check.get("allowed", True):
